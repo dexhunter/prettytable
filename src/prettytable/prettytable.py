@@ -31,6 +31,7 @@
 
 from __future__ import annotations
 
+import operator
 from enum import IntEnum
 from functools import lru_cache
 from typing import Any, Literal, cast
@@ -502,6 +503,15 @@ class PrettyTable:
             )
 
     def _justify(self, text: str, width: int, align: AlignType) -> str:
+        if text.isascii() and text.isprintable():
+            # Printable ASCII text has one display cell per character
+            if align == "l":
+                return text.ljust(width)
+            elif align == "r":
+                return text.rjust(width)
+            else:
+                return text.center(width)
+
         import wcwidth
 
         if align == "l":
@@ -2465,93 +2475,139 @@ class PrettyTable:
         return "".join(bits)
 
     def _stringify_row(self, row: list[str], options: OptionsType, hrule: str) -> str:
-        import wcwidth
-
-        for index, field, value, width in zip(
-            range(len(row)), self._field_names, row, self._widths
-        ):
-            # Enforce max widths
-            lines = value.split("\n")
-            new_lines: list[str] = []
-            for line in lines:
-                if (
-                    line == "None"
-                    and (none_val := self.none_format.get(field)) is not None
-                ):
-                    line = none_val
-                if _str_block_width(line) > width:
-                    line = "\n".join(
-                        wcwidth.wrap(
-                            line, width, break_on_hyphens=options["break_on_hyphens"]
-                        )
-                    )
-                new_lines.append(line)
-            lines = new_lines
-            value = "\n".join(lines)
-            row[index] = value
-
-        row_height = max(_get_size(c)[1] for c in row)
-
-        bits: list[list[str]] = []
+        field_names = self._field_names
+        widths = self._widths
+        border = options["border"]
+        vrules = options["vrules"]
+        fields = options["fields"]
         lpad, rpad = self._get_padding_widths(options)
-        for y in range(row_height):
-            bits.append([])
-            if options["border"]:
-                if options["vrules"] in (VRuleStyle.ALL, VRuleStyle.FRAME):
-                    bits[y].append(self.vertical_char)
-                else:
-                    bits[y].append(" ")
+        lpad_str = " " * lpad
+        rpad_str = " " * rpad
+        align_map = self._align
 
-        for field, value, width in zip(self._field_names, row, self._widths):
-            valign = self._valign[field]
-            lines = value.split("\n")
-            d_height = row_height - len(lines)
-            if d_height:
-                if valign == "m":
-                    lines = (
-                        [""] * int(d_height / 2)
-                        + lines
-                        + [""] * (d_height - int(d_height / 2))
-                    )
-                elif valign == "b":
-                    lines = [""] * d_height + lines
-                else:
-                    lines = lines + [""] * d_height
-
-            for y, line in enumerate(lines):
-                if options["fields"] and field not in options["fields"]:
+        # Justified (unpadded) cells of each displayed column: a single string
+        # when the row is one line tall, otherwise a list of row_height lines
+        columns: list = []
+        # Check the text of the whole row at once: a newline is not printable,
+        # so printable ASCII text means every cell is a single line
+        row_text = "".join(row)
+        if (
+            len(row) == len(field_names)
+            and row_text.isascii()
+            and row_text.isprintable()
+            and "None" not in row
+            and all(map(operator.le, map(len, row), widths))
+        ):
+            # Fast path: every cell is one line of printable ASCII text that
+            # already fits, so it needs no wrapping and pads with str methods
+            row_height = 1
+            for field, value, width in zip(field_names, row, widths):
+                if fields and field not in fields:
                     continue
+                align = align_map[field]
+                if align == "l":
+                    columns.append(value.ljust(width))
+                elif align == "r":
+                    columns.append(value.rjust(width))
+                else:
+                    columns.append(value.center(width))
+        else:
+            import wcwidth
 
-                bits[y].append(
-                    " " * lpad
-                    + self._justify(line, width, self._align[field])
-                    + " " * rpad
-                )
-                if options["border"] or options["preserve_internal_border"]:
-                    if options["vrules"] == VRuleStyle.ALL:
-                        bits[y].append(self.vertical_char)
+            break_on_hyphens = options["break_on_hyphens"]
+            for index, field, value, width in zip(
+                range(len(row)), field_names, row, widths
+            ):
+                # A single line that already fits needs no changes
+                if (
+                    "\n" not in value
+                    and value != "None"
+                    and _str_block_width(value) <= width
+                ):
+                    continue
+                # Enforce max widths
+                new_lines: list[str] = []
+                for line in value.split("\n"):
+                    if (
+                        line == "None"
+                        and (none_val := self.none_format.get(field)) is not None
+                    ):
+                        line = none_val
+                    if _str_block_width(line) > width:
+                        line = "\n".join(
+                            wcwidth.wrap(line, width, break_on_hyphens=break_on_hyphens)
+                        )
+                    new_lines.append(line)
+                row[index] = "\n".join(new_lines)
+
+            row_height = max(value.count("\n") for value in row) + 1
+            justify = self._justify
+            valign_map = self._valign
+
+            for field, value, width in zip(field_names, row, widths):
+                valign = valign_map[field]
+                if fields and field not in fields:
+                    continue
+                align = align_map[field]
+                if row_height == 1:
+                    columns.append(justify(value, width, align))
+                    continue
+                lines = value.split("\n")
+                d_height = row_height - len(lines)
+                if d_height:
+                    if valign == "m":
+                        top = d_height // 2
+                        lines = [""] * top + lines + [""] * (d_height - top)
+                    elif valign == "b":
+                        lines = [""] * d_height + lines
                     else:
-                        bits[y].append(" ")
+                        lines = lines + [""] * d_height
+                columns.append([justify(line, width, align) for line in lines])
 
-        # If only preserve_internal_border is true, then we just appended
-        # a vertical character at the end when we wanted a space
-        if not options["border"] and options["preserve_internal_border"]:
-            bits[-1].pop()
-            bits[-1].append(" ")
+        # Pick the left edge, the column separator, the end of each line and
+        # the end of the last line for the border and vrules style
+        vertical_char = self._vertical_char
+        if border:
+            if vrules == VRuleStyle.ALL:
+                left = sep = end = last_end = vertical_char
+            elif vrules == VRuleStyle.FRAME:
+                left = vertical_char
+                sep = " "
+                end = last_end = options["vertical_char"]
+            else:
+                left = sep = end = last_end = " "
+        elif options["preserve_internal_border"]:
+            left = ""
+            sep = end = vertical_char if vrules == VRuleStyle.ALL else " "
+            last_end = " "
+        else:
+            left = sep = end = last_end = ""
 
-        # If vrules is FRAME, then we just appended a space at the end
-        # of the last field, when we really want a vertical character
-        for y in range(row_height):
-            if options["border"] and options["vrules"] == VRuleStyle.FRAME:
-                bits[y].pop()
-                bits[y].append(options["vertical_char"])
+        if not columns:
+            if border and vrules == VRuleStyle.FRAME:
+                left = options["vertical_char"]
+            out_lines = [left] * row_height
+        else:
+            # Join the cells with the padding around each separator so that
+            # each cell needs no padded copy of its own
+            head = left + lpad_str
+            inner = rpad_str + sep + lpad_str
+            if row_height == 1:
+                line = head + inner.join(columns) + rpad_str + last_end
+                if border and options["hrules"] == HRuleStyle.ALL:
+                    return line + "\n" + hrule
+                return line
+            else:
+                tail = rpad_str + end
+                out_lines = [head + inner.join(parts) + tail for parts in zip(*columns)]
+                out_lines[-1] = (
+                    out_lines[-1][: len(out_lines[-1]) - len(end)] + last_end
+                )
 
-        if options["border"] and options["hrules"] == HRuleStyle.ALL:
-            bits[row_height - 1].append("\n")
-            bits[row_height - 1].append(hrule)
+        if border and options["hrules"] == HRuleStyle.ALL:
+            out_lines[-1] += "\n" + hrule
 
-        bits_str = ["".join(bits_y) for bits_y in bits]
-        return "\n".join(bits_str)
+        return "\n".join(out_lines)
 
     def paginate(self, page_length: int = 58, line_break: str = "\f", **kwargs) -> str:
         """Return string representation of table split into pages.
@@ -3077,6 +3133,10 @@ class PrettyTable:
 
 @lru_cache
 def _str_block_width(val: str) -> int:
+    if val.isascii() and val.isprintable():
+        # Printable ASCII text has one display cell per character
+        return len(val)
+
     import wcwidth
 
     return wcwidth.width(val)
